@@ -666,6 +666,15 @@ handleCrossing(PuglWrapperView* view, NSEvent* event, const PuglEventType type)
 
 - (void)keyDown:(NSEvent*)event
 {
+  // When the local key-event monitor is active it is the sole path for events
+  // the plugin wants (it consumes them before they reach here). Anything that
+  // reaches the responder chain is something the plugin did not want, so pass
+  // it to the host instead of dispatching/swallowing it here.
+  if (puglview->impl->keyboardEventFilter) {
+    [super keyDown:event];
+    return;
+  }
+
   if (puglview->hints[PUGL_IGNORE_KEY_REPEAT] && [event isARepeat]) {
     return;
   }
@@ -701,6 +710,12 @@ handleCrossing(PuglWrapperView* view, NSEvent* event, const PuglEventType type)
 
 - (void)keyUp:(NSEvent*)event
 {
+  // Forward to the host while the monitor is active, as in -keyDown:.
+  if (puglview->impl->keyboardEventFilter) {
+    [super keyUp:event];
+    return;
+  }
+
   const NSPoint   wloc  = [self eventLocation:event];
   const NSPoint   rloc  = [NSEvent mouseLocation];
   const PuglKey   spec  = keySymToSpecial(event);
@@ -1410,6 +1425,12 @@ puglFreeViewInternals(PuglView* view)
     }
 
     if (view->impl) {
+      if (view->impl->keyEventMonitor) {
+        [NSEvent removeMonitor:view->impl->keyEventMonitor];
+        [view->impl->keyEventMonitor release];
+        view->impl->keyEventMonitor = nil;
+      }
+
       if (view->impl->wrapperView) {
         [view->impl->wrapperView removeFromSuperview];
         view->impl->wrapperView->puglview = NULL;
@@ -1451,19 +1472,183 @@ puglHasFocus(const PuglView* view)
           [[impl->wrapperView window] firstResponder] == impl->wrapperView);
 }
 
+// Synthesise PUGL_TEXT events directly from an NSEvent's characters. AppKit's
+// normal text-input path is -interpretKeyEvents: (called from -keyDown:), which
+// routes through NSTextInputContext and replies via -insertText:. But we handle
+// wanted key events inside the local event monitor and consume them, so they
+// never reach -keyDown:; we therefore produce the text ourselves. This bypasses
+// the input context, so IME composition and dead keys are unsupported.
+static void
+dispatchMonitoredText(PuglWrapperView* const wrapperView, NSEvent* const event)
+{
+  // Command-modified keys are shortcuts, not text input.
+  if (getModifiers(event) & PUGL_MOD_SUPER) {
+    return;
+  }
+
+  NSString* const characters = [event characters];
+  if ([characters length] == 0) {
+    return;
+  }
+
+  // Skip AppKit's private-use range for function/arrow keys and the DEL control
+  // character; these are not text to insert.
+  if ([characters length] == 1) {
+    const unichar c = [characters characterAtIndex:0];
+    if ((c >= NSUpArrowFunctionKey && c <= 0xF8FF) || c == 0x7F) {
+      return;
+    }
+  }
+
+  const NSPoint wloc = [wrapperView eventLocation:event];
+  const NSPoint rloc = [NSEvent mouseLocation];
+  for (NSUInteger i = 0; i < [characters length]; ++i) {
+    const uint32_t code    = [characters characterAtIndex:i];
+    char           utf8[8] = {0};
+    NSUInteger     len     = 0;
+
+    [characters getBytes:utf8
+               maxLength:sizeof(utf8)
+              usedLength:&len
+                encoding:NSUTF8StringEncoding
+                 options:0
+                   range:NSMakeRange(i, i + 1)
+          remainingRange:nil];
+
+    PuglTextEvent ev = {
+      PUGL_TEXT,
+      0U,
+      [event timestamp],
+      wloc.x,
+      wloc.y,
+      rloc.x,
+      [[NSScreen mainScreen] frame].size.height - rloc.y,
+      getModifiers(event),
+      [event keyCode],
+      code,
+      { 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    memcpy(ev.string, utf8, len);
+
+    PuglEvent textEvent;
+    textEvent.text = ev;
+    puglDispatchEvent(wrapperView->puglview, &textEvent);
+  }
+}
+
+static NSEvent*
+handleMonitoredKeyEvent(PuglView* const view, NSEvent* const event)
+{
+  PuglWrapperView* const        wrapperView = view->impl->wrapperView;
+  PuglKeyboardEventFilter const filter      = view->impl->keyboardEventFilter;
+  if (!wrapperView || !filter) {
+    return event;
+  }
+
+  const bool      isDown = ([event type] == NSEventTypeKeyDown);
+  const PuglKey   spec   = keySymToSpecial(event);
+  const NSString* chars  = [event charactersIgnoringModifiers];
+  const char*     str    = [[chars lowercaseString] UTF8String];
+  const uint32_t  code   = (spec ? spec : puglDecodeUTF8((const uint8_t*)str));
+
+  const NSPoint wloc = [wrapperView eventLocation:event];
+  const NSPoint rloc = [NSEvent mouseLocation];
+
+  const PuglKeyEvent ev = {
+    isDown ? PUGL_KEY_PRESS : PUGL_KEY_RELEASE,
+    0U,
+    [event timestamp],
+    wloc.x,
+    wloc.y,
+    rloc.x,
+    [[NSScreen mainScreen] frame].size.height - rloc.y,
+    puglFilterMods(getModifiers(event), spec),
+    [event keyCode],
+    (code != 0xFFFD) ? code : 0,
+  };
+
+  // Ask the plugin whether it wants this event. If not, return it so it flows
+  // on through the responder chain to the host (transport shortcuts etc.).
+  PuglEvent keyEvent;
+  keyEvent.key = ev;
+  if (!filter(view, &keyEvent)) {
+    return event;
+  }
+
+  if (view->hints[PUGL_IGNORE_KEY_REPEAT] && isDown && [event isARepeat]) {
+    return nil;
+  }
+
+  puglDispatchEvent(view, &keyEvent);
+
+  // Only generate text while our window is key, i.e. the user is typing into us
+  // rather than into another window in the host process.
+  if (isDown && !spec) {
+    NSWindow* const window = [wrapperView window];
+    if (window && [window isKeyWindow]) {
+      dispatchMonitoredText(wrapperView, event);
+    }
+  }
+
+  return nil; // Consume: the host must not also see this event.
+}
+
 PuglStatus
 puglSetWantsAllKeyboardEvents(PuglView*               view,
                               bool                    wantsEvents,
                               PuglKeyboardEventFilter filterFunction)
 {
-  (void)filterFunction;
+  // Capture keyboard input for a plugin window without stealing it from the
+  // host. Two mechanisms combine (technique adapted from CPLUG, link below):
+  //
+  // 1. Make our view the first responder. This is what causes the host to route
+  //    key events to our window at all; without it, in hosts like Logic Pro the
+  //    local monitor below never fires because the events never reach us. We do
+  //    NOT call makeKeyWindow - that is what steals the host's transport
+  //    shortcuts (spacebar play/stop etc.).
+  //
+  // 2. Install a process-wide local NSEvent monitor. For each key event we
+  //    synthesise a PuglEvent and ask the filter whether the plugin wants it.
+  //    If so we dispatch it to the plugin and consume it (return nil); if not
+  //    we return it so it flows on through the responder chain.
+  //
+  // Because the monitor consumes every event the plugin wants, the only key
+  // events reaching -keyDown:/-keyUp: are ones the plugin did not want; those
+  // forward to the host (via super) so its shortcuts keep working.
+  //
+  // https://github.com/Tremus/CPLUG/blob/master/src/cplug_extensions/window_osx.m
+  PuglInternals* const impl = view->impl;
 
-  if (wantsEvents) {
-    if (!puglHasFocus(view)) {
-      puglGrabFocus(view);
-    }
+  if (impl->keyEventMonitor) {
+    [NSEvent removeMonitor:impl->keyEventMonitor];
+    [impl->keyEventMonitor release];
+    impl->keyEventMonitor = nil;
   }
 
+  NSWindow* const window = [impl->wrapperView window];
+
+  if (!wantsEvents || !filterFunction) {
+    impl->keyboardEventFilter = NULL;
+    if (window && [window firstResponder] == impl->wrapperView) {
+      [window makeFirstResponder:nil];
+    }
+    return PUGL_SUCCESS;
+  }
+
+  impl->keyboardEventFilter = filterFunction;
+
+  if (window && [window firstResponder] != impl->wrapperView) {
+    [window makeFirstResponder:impl->wrapperView];
+  }
+
+  const NSEventMask mask    = NSEventMaskKeyDown | NSEventMaskKeyUp;
+  id                monitor = [NSEvent
+    addLocalMonitorForEventsMatchingMask:mask
+                                 handler:^NSEvent*(NSEvent* e) {
+                                   return handleMonitoredKeyEvent(view, e);
+                                 }];
+
+  impl->keyEventMonitor = [monitor retain];
   return PUGL_SUCCESS;
 }
 
