@@ -971,12 +971,24 @@ setClipboardFormats(PuglView* const         view,
 
   board->formatStrings = newFormatStrings;
 
+  // Both UTF8_STRING and a bare "text/plain" target are exposed as
+  // "text/plain", but sources like GTK serve the bare target as ASCII (with
+  // \uXXXX escapes), so drop it when the UTF-8 one is available
+  bool hasUtf8String = false;
+  for (unsigned long i = 0; i < numFormats; ++i) {
+    if (formats[i] == view->world->impl->atoms.UTF8_STRING) {
+      hasUtf8String = true;
+    }
+  }
+
   for (unsigned long i = 0; i < numFormats; ++i) {
     if (formats[i]) {
       char* const name = XGetAtomName(view->world->impl->display, formats[i]);
       const char* type = NULL;
 
-      if (strchr(name, '/')) { // MIME type (hopefully)
+      if (hasUtf8String && !strcmp(name, "text/plain")) {
+        type = NULL;
+      } else if (strchr(name, '/')) { // MIME type (hopefully)
         type = name;
       } else if (!strcmp(name, "UTF8_STRING")) { // Plain text
         type = "text/plain";
