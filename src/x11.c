@@ -2125,9 +2125,27 @@ puglSetClipboard(PuglView* const   view,
   PuglStatus              st      = puglSetBlob(&board->data, data, len);
 
   if (!st) {
-    const Atom format = {XInternAtom(display, type, 0)};
+    const char* const mimeType = type ? type : "text/plain";
 
-    st = setClipboardFormats(view, board, 1, &format);
+    // Wayland clients behind an X11 bridge (like xwayland-satellite) only see
+    // the advertised target names as MIME types, while X11 clients expect
+    // UTF8_STRING, so advertise text under both conventions
+    if (!strcmp(mimeType, "UTF8_STRING") || !strcmp(mimeType, "text/plain") ||
+        !strcmp(mimeType, "text/plain;charset=utf-8")) {
+      const Atom formats[] = {
+        view->world->impl->atoms.UTF8_STRING,
+        XInternAtom(display, "text/plain;charset=utf-8", 0),
+        XInternAtom(display, "text/plain", 0),
+      };
+
+      st = setClipboardFormats(
+        view, board, sizeof(formats) / sizeof(formats[0]), formats);
+    } else {
+      const Atom format = {XInternAtom(display, mimeType, 0)};
+
+      st = setClipboardFormats(view, board, 1, &format);
+    }
+
     XSetSelectionOwner(display, board->selection, impl->win, CurrentTime);
 
     board->source = impl->win;
